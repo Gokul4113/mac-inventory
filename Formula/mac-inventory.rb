@@ -22,7 +22,7 @@ class MacInventory < Formula
 
   # ── Replace these after creating a GitHub release ──────────────────────────
   url "https://github.com/Gokul4113/mac-inventory/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "REPLACE_WITH_ACTUAL_SHA256_AFTER_RELEASE"
+  sha256 "bca6b26cd235026e3b9dadbdcc142811803927292ab0002c65a11277a8f99072"
   # ──────────────────────────────────────────────────────────────────────────
 
   version "1.0.0"
