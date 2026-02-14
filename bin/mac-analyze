@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+mac-analyze
+-----------
+Scans mac-inventory JSON output for potential vulnerabilities using the NVD API.
+"""
+
+import json
+import csv
+import sys
+import re
+import time
+import argparse
+import urllib.request
+import urllib.error
+import urllib.parse
+import ssl
+from typing import List, Dict, Any, Optional
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+NVD_API_KEY = "412eaf94-c477-4d50-b67c-26a659e8829a"
+BASE_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+REQ_TIMEOUT = 10
+MAX_RETRIES = 3
+BASE_DELAY = 0.6  # 0.6s delay = ~1.6 req/s (Limit: 50 req/30s)
+
+HEADERS = {
+    "User-Agent": "mac-analyze/1.2",
+    "apiKey": NVD_API_KEY
+}
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+def normalize_name(s: str) -> str:
+    """Cleans up software names for better CPE matching."""
+    s = (s or "").strip().lower()
+    s = re.sub(r"\.app$", "", s)
+    s = s.replace("&", "and").replace("+", "plus")
+    s = re.sub(r"[()/]", " ", s)
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^a-z0-9._-]+", "_", s)
+    return re.sub(r"_+", "_", s).strip("_")
+
+def normalize_version(v: str) -> str:
+    """Extracts a clean semantic version."""
+    v = (v or "").strip()
+    v = re.sub(r"^(?:version|ver|v)\s*[:=_-]?\s*", "", v, flags=re.I)
+    match = re.search(r"\d+(?:\.\d+)+", v)
+    if match:
+        return match.group(0)
+    return v
+
+def get_product_aliases(vendor: str, product: str) -> List[str]:
+    """Returns list of alternative product names to try."""
+    aliases = [product]
+    if product.startswith(f"{vendor}_"):
+        aliases.append(product[len(vendor)+1:])
+    mapping = {
+        "google_chrome": ["chrome"],
+        "mozilla_firefox": ["firefox"],
+        "microsoft_office": ["office"],
+        "adobe_acrobat_reader": ["acrobat_reader", "reader"],
+    }
+    if product in mapping:
+        aliases.extend(mapping[product])
+    return list(dict.fromkeys(aliases))
+
+# ── API Client ──────────────────────────────────────────────────────────────
+
+def request_json(url: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """Performs HTTP GET with retries, exponential backoff, and SSL fallback."""
+    query_string = urllib.parse.urlencode(params)
+    full_url = f"{url}?{query_string}"
+    
+    strategies = [
+        {"context": ssl.create_default_context(), "name": "strict"},
+        {"context": ssl._create_unverified_context(), "name": "unverified"}
+    ]
+    
+    delays = [1.0, 2.0, 4.0] 
+
+    for strategy in strategies:
+        context = strategy["context"]
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                req = urllib.request.Request(full_url, headers=HEADERS)
+                with urllib.request.urlopen(req, context=context, timeout=REQ_TIMEOUT) as response:
+                    if response.status == 200:
+                        return json.loads(response.read().decode('utf-8'))
+                    elif response.status == 429:
+                        time.sleep(delays[min(attempt, 2)])
+                        continue
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504):
+                    time.sleep(delays[min(attempt, 2)])
+                    continue
+                break 
+            except urllib.error.URLError as e:
+                reason = str(e.reason).lower()
+                if "verify failed" in reason or "certificate" in reason or "ssl" in reason:
+                    # Switch to unverified context
+                    break 
+                time.sleep(delays[min(attempt, 2)])
+                continue
+            except Exception:
+                break
+    return {}
+
+def search_cves(vendor: str, product: str, version: str) -> List[Dict[str, Any]]:
+    """Query NVD for CVEs using a virtual match string."""
+    params = {
+        "virtualMatchString": f"cpe:2.3:a:{vendor}:{product}",
+        "versionStart": version,
+        "versionStartType": "including",
+        "versionEnd": version,
+        "versionEndType": "including",
+        "resultsPerPage": "100"
+    }
+    data = request_json(BASE_CVE_URL, params)
+    return data.get("vulnerabilities", [])
+
+# ── Analysis Logic ──────────────────────────────────────────────────────────
+
+def analyze_software(name: str, raw_version: str, source: str, path: str) -> Optional[Dict[str, Any]]:
+    """Analyzes a single software item."""
+    if path and (path.startswith("/System/") or path.startswith("/Library/")):
+        return None
+
+    norm_n = normalize_name(name)
+    norm_v = normalize_version(raw_version)
+    
+    parts = norm_n.split('_')
+    vendor = parts[0] if parts else "unknown"
+    product = norm_n
+    
+    aliases = get_product_aliases(vendor, product)
+    vulns = []
+    
+    for alias in aliases:
+        found_vulns = search_cves(vendor, alias, norm_v)
+        if found_vulns:
+            vulns = found_vulns
+            product = alias
+            break
+        found_vulns = search_cves("*", alias, norm_v)
+        if found_vulns:
+            vulns = found_vulns
+            vendor = "*"
+            product = alias
+            break
+
+    cve_ids = []
+    max_score = 0.0
+    severity = "NONE"
+    
+    for item in vulns:
+        cve = item.get("cve", {})
+        cve_ids.append(cve.get("id"))
+        
+        metrics = cve.get("metrics", {})
+        cvss_data = None
+        for metric_type in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
+            if metric_type in metrics:
+                cvss_data = metrics[metric_type][0].get("cvssData", {})
+                break
+        
+        if cvss_data:
+            score = cvss_data.get("baseScore", 0.0)
+            if score > max_score:
+                max_score = score
+                severity = cvss_data.get("baseSeverity", "UNKNOWN")
+
+    return {
+        "software": name,
+        "version": raw_version,
+        "source": source,
+        "normalized_product": product,
+        "normalized_version": norm_v,
+        "cve_count": len(cve_ids),
+        "max_cvss": max_score,
+        "severity": severity,
+        "cve_list": ";".join(cve_ids[:5])
+    }
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze mac-inventory output for vulnerabilities")
+    parser.add_argument("-i", "--input", required=True, help="Input JSON file")
+    parser.add_argument("-o", "--output", required=True, help="Output CSV file")
+    args = parser.parse_args()
+
+    try:
+        with open(args.input, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        sys.exit(f"Error reading JSON: {e}")
+
+    software_map = {}
+    for app in data.get("data", {}).get("apps", []):
+        key = (app.get("name"), app.get("version"), app.get("path"))
+        if key not in software_map: software_map[key] = "Application"
+    for pkg in data.get("data", {}).get("homebrew_packages", []):
+        key = (pkg.get("name"), pkg.get("version"), pkg.get("path"))
+        if key not in software_map: software_map[key] = "Homebrew"
+
+    total = len(software_map)
+    results = []
+    
+    print(f"Analyzing {total} unique software items...")
+    print(f"Checking NVD (approx 0.6s per item)...")
+    
+    count = 0
+    for (name, ver, path), source in software_map.items():
+        count += 1
+        sys.stdout.write(f"\r[{count}/{total}] Checking {name} v{ver}...")
+        sys.stdout.flush()
+        
+        time.sleep(BASE_DELAY)
+        
+        try:
+            res = analyze_software(name, ver, source, path)
+            if res and res['cve_count'] > 0:
+                 results.append(res)
+        except Exception:
+            continue
+            
+    print("\n\nAnalysis complete.")
+    
+    fieldnames = ["software", "version", "source", "normalized_product", "normalized_version", "cve_count", "max_cvss", "severity", "cve_list"]
+    
+    try:
+        with open(args.output, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"Report saved to: {args.output}")
+        print(f"Vulnerable items found: {len(results)}")
+    except Exception as e:
+        sys.exit(f"Error writing CSV: {e}")
+
+if __name__ == "__main__":
+    main()

@@ -24,13 +24,40 @@ chmod +x bin/mac-inventory
 ## Usage
 
 ```bash
-mac-inventory                        # output → ./osq_out/final_inventory.json
-mac-inventory -o ~/Desktop/audit     # custom output directory
-mac-inventory --version              # print version
-mac-inventory --help                 # show help
-mac-inventory -f csv                 # get CSV files instead
-mac-inventory -f all                 # get both JSON + CSV
+mac-inventory [OPTIONS]
 ```
+
+### Options
+
+| Flag | Description |
+| :--- | :--- |
+| `-o, --output DIR` | Specify output directory (default: `./osq_out`) |
+| `-f, --format FMT` | Output format: `json` (default), `csv`, or `all` |
+| `-s, --scan`       | **New:** Run vulnerability scan against NVD (Internet required) |
+| `-v, --version`    | Show version |
+| `-h, --help`       | Show help message |
+
+### Examples
+
+**1. Standard Inventory (JSON):**
+```bash
+mac-inventory
+# Output: ./osq_out/final_inventory.json
+```
+
+**2. Inventory + CSV Export:**
+```bash
+mac-inventory -f all
+# Output: ./osq_out/csv/*.csv
+```
+
+**3. Vulnerability Scan (Security Audit):**
+```bash
+mac-inventory --scan
+# Output: ./osq_out/security_audit.csv
+```
+
+> **Note:** The scan takes a few minutes as it respects the NVD API rate limits. It filters out system apps to focus on user-installed software. All data processing happens locally; only software names/versions are sent to the NVD API.
 
 ## What It Collects
 
