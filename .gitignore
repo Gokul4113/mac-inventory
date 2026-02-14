@@ -1,0 +1,17 @@
+# Output files
+osq_out/
+*.json
+
+# macOS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

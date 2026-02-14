@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# mac-inventory — Collect macOS software inventory via osquery into one JSON file.
+# https://github.com/Gokul4113/mac-inventory
+
+set -euo pipefail
+
+VERSION="1.0.0"
+PROGRAM_NAME="mac-inventory"
+
+# ─── Helpers ────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+${PROGRAM_NAME} v${VERSION}
+Collect a full macOS software inventory and export it as JSON.
+
+USAGE
+  ${PROGRAM_NAME} [OPTIONS]
+
+OPTIONS
+  -o, --output DIR   Output directory (default: ./osq_out)
+  -v, --version      Print version and exit
+  -h, --help         Show this help message
+
+EXAMPLES
+  ${PROGRAM_NAME}                      # writes to ./osq_out/final_inventory.json
+  ${PROGRAM_NAME} -o ~/Desktop/audit   # writes to ~/Desktop/audit/final_inventory.json
+
+REQUIREMENTS
+  osquery   — installed via 'brew install osquery'
+  jq        — installed via 'brew install jq'
+
+Both are installed automatically when you install via Homebrew tap.
+EOF
+}
+
+green()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[1;33m%s\033[0m\n' "$*"; }
+red()    { printf '\033[1;31m%s\033[0m\n' "$*"; }
+info()   { printf '  → %s\n' "$*"; }
+
+# ─── Parse arguments ────────────────────────────────────────────────────────────
+
+OUT_DIR="./osq_out"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output)
+      OUT_DIR="$2"
+      shift 2
+      ;;
+    -v|--version)
+      echo "${PROGRAM_NAME} ${VERSION}"
+      exit 0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+# ─── Preflight checks ───────────────────────────────────────────────────────────
+
+OSQUERYI="$(command -v osqueryi || true)"
+if [[ -z "${OSQUERYI}" ]]; then
+  red "ERROR: osqueryi not found in PATH."
+  echo "Install it with:  brew install osquery"
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  red "ERROR: jq not found in PATH."
+  echo "Install it with:  brew install jq"
+  exit 1
+fi
+
+mkdir -p "$OUT_DIR"
+
+# ─── Query runner ────────────────────────────────────────────────────────────────
+
+TOTAL=9
+CURRENT=0
+
+run_q() {
+  local name="$1"
+  local sql="$2"
+  CURRENT=$((CURRENT + 1))
+
+  printf '  [%d/%d] Collecting %-25s' "$CURRENT" "$TOTAL" "${name}..."
+
+  if "$OSQUERYI" --json "$sql" > "${OUT_DIR}/${name}.json" 2> "${OUT_DIR}/${name}.err"; then
+    rm -f "${OUT_DIR}/${name}.err"
+    green " ✓"
+  else
+    local err
+    err="$(tail -n 200 "${OUT_DIR}/${name}.err" 2>/dev/null | jq -Rs . 2>/dev/null || echo '""')"
+    echo "{\"error\": ${err}}" > "${OUT_DIR}/${name}.json"
+    yellow " ⚠ (see ${name}.err)"
+  fi
+}
+
+# ─── Banner ──────────────────────────────────────────────────────────────────────
+
+echo ""
+green "╔════════════════════════════════════════════╗"
+green "║       mac-inventory  v${VERSION}             ║"
+green "╚════════════════════════════════════════════╝"
+echo ""
+info "Output directory: ${OUT_DIR}"
+echo ""
+
+# ─── Queries ─────────────────────────────────────────────────────────────────────
+
+run_q "apps" "
+SELECT
+  name,
+  bundle_identifier,
+  bundle_short_version AS version,
+  bundle_version AS build,
+  path
+FROM apps
+ORDER BY name;
+"
+
+run_q "package_receipts" "
+SELECT
+  package_id,
+  version,
+  install_time,
+  installer_name,
+  location,
+  path
+FROM package_receipts
+ORDER BY install_time DESC;
+"
+
+run_q "homebrew_packages" "
+SELECT
+  name,
+  version,
+  path
+FROM homebrew_packages
+ORDER BY name;
+"
+
+run_q "startup_items" "
+SELECT
+  name,
+  type,
+  status,
+  username,
+  path
+FROM startup_items
+ORDER BY name;
+"
+
+run_q "kernel_extensions" "
+SELECT
+  name,
+  version,
+  path,
+  idx,
+  linked_against
+FROM kernel_extensions
+ORDER BY name;
+"
+
+run_q "safari_extensions" "
+SELECT
+  u.username,
+  e.name,
+  e.identifier,
+  e.version,
+  e.bundle_version,
+  e.path
+FROM users u
+JOIN safari_extensions e
+ON u.uid = e.uid
+ORDER BY u.username, e.name;
+"
+
+run_q "os_version" "
+SELECT
+  name,
+  version,
+  major,
+  minor,
+  patch,
+  build,
+  arch
+FROM os_version;
+"
+
+run_q "processes" "
+SELECT
+  name,
+  pid,
+  path,
+  cmdline
+FROM processes
+ORDER BY name;
+"
+
+run_q "launchd" "
+SELECT
+  name,
+  path,
+  program,
+  run_at_load,
+  keep_alive
+FROM launchd
+ORDER BY name;
+"
+
+# ─── Metadata ────────────────────────────────────────────────────────────────────
+
+echo ""
+info "Collecting system metadata..."
+
+NOW_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+HOST="$(scutil --get LocalHostName 2>/dev/null || hostname)"
+OS_VER="$(sw_vers -productVersion 2>/dev/null || echo "")"
+OS_BUILD="$(sw_vers -buildVersion 2>/dev/null || echo "")"
+SERIAL="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2; exit}' || true)"
+ARCH="$(uname -m 2>/dev/null || true)"
+
+# ─── Merge into final JSON ──────────────────────────────────────────────────────
+
+info "Merging into final JSON..."
+
+jq -n \
+  --arg collected_at "$NOW_UTC" \
+  --arg hostname "$HOST" \
+  --arg os_version_sw "$OS_VER" \
+  --arg os_build_sw "$OS_BUILD" \
+  --arg serial "$SERIAL" \
+  --arg arch_uname "$ARCH" \
+  --arg tool_version "$VERSION" \
+  --slurpfile apps "${OUT_DIR}/apps.json" \
+  --slurpfile package_receipts "${OUT_DIR}/package_receipts.json" \
+  --slurpfile homebrew_packages "${OUT_DIR}/homebrew_packages.json" \
+  --slurpfile startup_items "${OUT_DIR}/startup_items.json" \
+  --slurpfile kernel_extensions "${OUT_DIR}/kernel_extensions.json" \
+  --slurpfile safari_extensions "${OUT_DIR}/safari_extensions.json" \
+  --slurpfile os_version "${OUT_DIR}/os_version.json" \
+  --slurpfile processes "${OUT_DIR}/processes.json" \
+  --slurpfile launchd "${OUT_DIR}/launchd.json" \
+  '{
+    metadata: {
+      collected_at: $collected_at,
+      device: {
+        hostname: $hostname,
+        serial_number: ($serial | select(. != "")),
+        os: "macOS",
+        os_version: $os_version_sw,
+        os_build: $os_build_sw,
+        arch: $arch_uname
+      },
+      generator: {
+        tool: "mac-inventory",
+        tool_version: $tool_version,
+        engine: "osqueryi",
+        format: "mac-inventory-pack-v1"
+      }
+    },
+    data: {
+      os_version: ($os_version[0] // []),
+      apps: ($apps[0] // []),
+      package_receipts: ($package_receipts[0] // []),
+      homebrew_packages: ($homebrew_packages[0] // []),
+      startup_items: ($startup_items[0] // []),
+      kernel_extensions: ($kernel_extensions[0] // []),
+      safari_extensions: ($safari_extensions[0] // []),
+      processes: ($processes[0] // []),
+      launchd: ($launchd[0] // [])
+    }
+  }' > "${OUT_DIR}/final_inventory.json"
+
+# ─── Summary ─────────────────────────────────────────────────────────────────────
+
+APPS_COUNT="$(jq '.data.apps | length' "${OUT_DIR}/final_inventory.json" 2>/dev/null || echo '?')"
+PKGS_COUNT="$(jq '.data.package_receipts | length' "${OUT_DIR}/final_inventory.json" 2>/dev/null || echo '?')"
+BREW_COUNT="$(jq '.data.homebrew_packages | length' "${OUT_DIR}/final_inventory.json" 2>/dev/null || echo '?')"
+
+echo ""
+green "════════════════════════════════════════════════"
+green " ✅  Inventory complete!"
+green "════════════════════════════════════════════════"
+echo ""
+info "File:  ${OUT_DIR}/final_inventory.json"
+info "Apps found:       ${APPS_COUNT}"
+info "PKG receipts:     ${PKGS_COUNT}"
+info "Brew packages:    ${BREW_COUNT}"
+info "Host:             ${HOST}"
+info "macOS:            ${OS_VER} (${OS_BUILD})"
+echo ""
