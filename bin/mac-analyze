@@ -157,23 +157,63 @@ APPLE_SYSTEM_APPS = {
 }
 
 
+# Suffixes commonly found in app names but absent from CPE product strings.
+# Used to generate aliases — the original normalized name is always tried first.
+STRIP_SUFFIXES = [
+    "_for_macos", "_for_mac", "_for_os_x",
+    "_desktop", "_browser", "_client", "_app",
+    "_edition", "_installer", "_updater", "_helper",
+    "_community", "_professional", "_enterprise",
+    "_ce", "_pro", "_free", "_lite",
+]
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def normalize_name(s: str) -> str:
-    """Cleans up software names for better CPE matching."""
+    """
+    Cleans up software names for better CPE matching.
+    
+    Pipeline:
+      1. Lowercase, strip .app suffix
+      2. Replace special chars (& → and, + → plus)
+      3. Normalize whitespace/separators to underscores
+      4. Strip trailing version numbers ("Xcode 15" → "xcode")
+      5. Strip trailing edition labels ("Pro", "Community", etc.)
+      6. Clean residual underscores
+    
+    The original name is always preserved in the output for traceability.
+    """
     s = (s or "").strip().lower()
     s = re.sub(r"\.app$", "", s)
     s = s.replace("&", "and").replace("+", "plus")
     s = re.sub(r"[()/]", " ", s)
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"[^a-z0-9._-]+", "_", s)
-    return re.sub(r"_+", "_", s).strip("_")
+    s = re.sub(r"_+", "_", s).strip("_")
+
+    # Strip trailing version numbers: "1password_7" → "1password"
+    # But preserve versions that ARE the name: "7-zip" stays
+    stripped = re.sub(r"[_.]\d+(\.\d+)*$", "", s)
+    if stripped and len(stripped) > 1:
+        s = stripped
+
+    return s
 
 def normalize_version(v: str) -> str:
-    """Extracts a clean semantic version."""
+    """
+    Extracts a clean semantic version.
+    Handles: "1.2.3", "v1.2.3", "Version 1.2", "build 1234", single "5".
+    """
     v = (v or "").strip()
+    if not v:
+        return ""
     v = re.sub(r"^(?:version|ver|v)\s*[:=_-]?\s*", "", v, flags=re.I)
+    # Try multi-part version first: "1.2.3"
     match = re.search(r"\d+(?:\.\d+)+", v)
+    if match:
+        return match.group(0)
+    # Accept single integer version: "5" (common for major-only versioning)
+    match = re.search(r"^\d+$", v)
     if match:
         return match.group(0)
     return v
@@ -197,15 +237,36 @@ def is_system_software(name: str, path: str) -> bool:
     return False
 
 def get_product_aliases(vendor: str, product: str) -> List[Tuple[str, str]]:
-    """Returns list of (vendor, product) pairs to try for CPE matching."""
+    """
+    Returns list of (vendor, product) pairs to try for CPE matching.
+    
+    Strategy (ordered from most to least specific):
+      1. Exact (vendor, product)
+      2. Vendor-prefix stripped: (google, google_chrome) → (google, chrome)
+      3. Suffix-stripped variants: (vendor, docker_desktop) → (vendor, docker)
+      4. Wildcard vendor as last resort
+    
+    The original name always goes first to preserve data integrity.
+    """
     pairs = [(vendor, product)]
 
     # Try without vendor prefix: "google_chrome" → "chrome"
-    if product.startswith(f"{vendor}_"):
+    if product.startswith(f"{vendor}_") and len(product) > len(vendor) + 1:
         stripped = product[len(vendor)+1:]
-        pairs.append((vendor, stripped))
+        if stripped:  # safety check
+            pairs.append((vendor, stripped))
 
-    # Try wildcard vendor as last resort
+    # Try stripping common suffixes: "brave_browser" → "brave"
+    for suffix in STRIP_SUFFIXES:
+        if product.endswith(suffix) and len(product) > len(suffix):
+            base = product[:-len(suffix)]
+            if base and len(base) > 1:  # don't reduce to single char
+                pairs.append((vendor, base))
+                # Also try with wildcard vendor
+                pairs.append(("*", base))
+            break  # only strip one suffix
+
+    # Try wildcard vendor with original product as last resort
     pairs.append(("*", product))
 
     # Deduplicate while preserving order
