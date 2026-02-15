@@ -9,16 +9,27 @@ class MacInventory < Formula
   version "1.2.0"
   license "MIT"
 
-  depends_on "osquery"
   depends_on "jq"
-  depends_on "python@3.12"
+  depends_on "python@3"
 
   def install
     bin.install "bin/mac-inventory"
     bin.install "bin/mac-analyze"
   end
 
+  def caveats
+    <<~EOS
+      mac-inventory requires osquery, which is available as a cask:
+        brew install --cask osquery
+
+      For vulnerability scanning (--scan), set your NVD API key:
+        echo 'NVD_API_KEY=your_key_here' > ~/.mac-inventory.env
+      Get a free key at: https://nvd.nist.gov/developers/request-an-api-key
+    EOS
+  end
+
   test do
     assert_match "mac-inventory #{version}", shell_output("#{bin}/mac-inventory --version")
   end
 end
+
