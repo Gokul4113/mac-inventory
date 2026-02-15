@@ -8,6 +8,7 @@ Scans mac-inventory JSON output for potential vulnerabilities using the NVD API.
 import json
 import csv
 import sys
+import os
 import re
 import time
 import argparse
@@ -15,20 +16,146 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import ssl
-from typing import List, Dict, Any, Optional
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-NVD_API_KEY = "412eaf94-c477-4d50-b67c-26a659e8829a"
-BASE_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-REQ_TIMEOUT = 10
-MAX_RETRIES = 3
-BASE_DELAY = 0.6  # 0.6s delay = ~1.6 req/s (Limit: 50 req/30s)
+def load_api_key() -> str:
+    """Load NVD API key from environment variable or .env file."""
+    # 1. Check environment variable first
+    key = os.environ.get("NVD_API_KEY", "").strip()
+    if key:
+        return key
 
-HEADERS = {
-    "User-Agent": "mac-analyze/1.2",
-    "apiKey": NVD_API_KEY
+    # 2. Search for .env file (script dir → parent → cwd)
+    search_dirs = [
+        Path(__file__).resolve().parent.parent,  # project root
+        Path(__file__).resolve().parent,          # bin/
+        Path.cwd(),                               # current directory
+    ]
+    for d in search_dirs:
+        env_file = d / ".env"
+        if env_file.is_file():
+            try:
+                for line in env_file.read_text().splitlines():
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == "NVD_API_KEY":
+                        return v.strip()
+            except OSError:
+                continue
+
+    return ""
+
+
+BASE_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+REQ_TIMEOUT = 15
+MAX_RETRIES = 3
+
+# Without API key: 5 req/30s (~6s delay); With key: 50 req/30s (~0.6s delay)
+def get_rate_delay(has_key: bool) -> float:
+    return 0.6 if has_key else 6.0
+
+# ── Known Vendor Mappings ───────────────────────────────────────────────────
+# Maps normalized product names to their correct CPE vendor strings.
+# This dramatically reduces false positives from naive first-word guessing.
+
+KNOWN_VENDORS: Dict[str, str] = {
+    # Browsers
+    "google_chrome": "google",
+    "firefox": "mozilla",
+    "mozilla_firefox": "mozilla",
+    "brave_browser": "brave",
+    "microsoft_edge": "microsoft",
+    "tor_browser": "torproject",
+    # Dev Tools
+    "visual_studio_code": "microsoft",
+    "sublime_text": "sublimehq",
+    "iterm2": "georgerechtenwald",
+    "docker": "docker",
+    "docker_desktop": "docker",
+    "postman": "postman",
+    "gitkraken": "gitkraken",
+    "intellij_idea": "jetbrains",
+    "pycharm": "jetbrains",
+    "webstorm": "jetbrains",
+    "datagrip": "jetbrains",
+    "goland": "jetbrains",
+    "rider": "jetbrains",
+    "clion": "jetbrains",
+    "rubymine": "jetbrains",
+    "android_studio": "google",
+    "xcode": "apple",
+    # Communication
+    "slack": "slack",
+    "zoom": "zoom",
+    "discord": "discord",
+    "microsoft_teams": "microsoft",
+    "telegram": "telegram",
+    "signal": "signal",
+    # Productivity
+    "notion": "notion",
+    "obsidian": "obsidian",
+    "1password": "agilebits",
+    "bitwarden": "bitwarden",
+    "lastpass": "lastpass",
+    # Media
+    "vlc": "videolan",
+    "spotify": "spotify",
+    "obs": "obsproject",
+    "handbrake": "handbrake",
+    # Adobe
+    "adobe_photoshop": "adobe",
+    "adobe_illustrator": "adobe",
+    "adobe_premiere_pro": "adobe",
+    "adobe_acrobat_reader": "adobe",
+    "adobe_creative_cloud": "adobe",
+    # Utilities
+    "alfred": "alfredapp",
+    "rectangle": "rectangleapp",
+    "karabiner-elements": "pqrs",
+    "bartender": "surteesstudios",
+    "appcleaner": "freemacsoft",
+    "the_unarchiver": "macpaw",
+    "transmission": "transmissionbt",
+    "wireshark": "wireshark",
+    "tunnelblick": "tunnelblick",
+    # Databases
+    "tableplus": "tableplus",
+    "dbeaver": "dbeaver",
+    "mongodb_compass": "mongodb",
+    "pgadmin": "pgadmin",
 }
+
+# System paths to always skip — these are OS-managed and create false positives
+SYSTEM_PATH_PREFIXES = (
+    "/System/",
+    "/Library/Apple/",
+    "/usr/libexec/",
+    "/usr/sbin/",
+    "/usr/bin/",
+    "/bin/",
+    "/sbin/",
+)
+
+# Known Apple system apps to skip (names that live under /Applications but are OS-managed)
+APPLE_SYSTEM_APPS = {
+    "finder", "safari", "mail", "calendar", "contacts", "notes", "reminders",
+    "messages", "facetime", "maps", "photos", "preview", "music", "tv",
+    "podcasts", "news", "stocks", "home", "voice_memos", "books",
+    "font_book", "keychain_access", "disk_utility", "activity_monitor",
+    "console", "terminal", "migration_assistant", "boot_camp_assistant",
+    "bluetooth_file_exchange", "audio_midi_setup", "colorsync_utility",
+    "digital_color_meter", "grapher", "screenshot", "system_information",
+    "system_preferences", "system_settings", "time_machine", "automator",
+    "script_editor", "siri", "dictionary", "chess", "stickies",
+    "photo_booth", "quicktime_player", "textedit", "archive_utility",
+    "installer", "directory_utility", "airport_utility",
+}
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -51,136 +178,242 @@ def normalize_version(v: str) -> str:
         return match.group(0)
     return v
 
-def get_product_aliases(vendor: str, product: str) -> List[str]:
-    """Returns list of alternative product names to try."""
-    aliases = [product]
+def is_system_software(name: str, path: str) -> bool:
+    """Determines if software is OS-managed and should be skipped."""
+    # Check path prefixes
+    if path:
+        for prefix in SYSTEM_PATH_PREFIXES:
+            if path.startswith(prefix):
+                return True
+        # /Library/ top-level is system-managed (but /Library is already covered)
+        if path.startswith("/Library/") and not path.startswith("/Library/Application Support/"):
+            return True
+
+    # Check known Apple apps by normalized name
+    norm = normalize_name(name)
+    if norm in APPLE_SYSTEM_APPS:
+        return True
+
+    return False
+
+def get_product_aliases(vendor: str, product: str) -> List[Tuple[str, str]]:
+    """Returns list of (vendor, product) pairs to try for CPE matching."""
+    pairs = [(vendor, product)]
+
+    # Try without vendor prefix: "google_chrome" → "chrome"
     if product.startswith(f"{vendor}_"):
-        aliases.append(product[len(vendor)+1:])
-    mapping = {
-        "google_chrome": ["chrome"],
-        "mozilla_firefox": ["firefox"],
-        "microsoft_office": ["office"],
-        "adobe_acrobat_reader": ["acrobat_reader", "reader"],
-    }
-    if product in mapping:
-        aliases.extend(mapping[product])
-    return list(dict.fromkeys(aliases))
+        stripped = product[len(vendor)+1:]
+        pairs.append((vendor, stripped))
+
+    # Try wildcard vendor as last resort
+    pairs.append(("*", product))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            unique.append(pair)
+    return unique
 
 # ── API Client ──────────────────────────────────────────────────────────────
 
-def request_json(url: str, params: Dict[str, str]) -> Dict[str, Any]:
-    """Performs HTTP GET with retries, exponential backoff, and SSL fallback."""
-    query_string = urllib.parse.urlencode(params)
-    full_url = f"{url}?{query_string}"
-    
-    strategies = [
-        {"context": ssl.create_default_context(), "name": "strict"},
-        {"context": ssl._create_unverified_context(), "name": "unverified"}
-    ]
-    
-    delays = [1.0, 2.0, 4.0] 
+class NVDClient:
+    """Handles NVD API communication with proper rate limiting and retries."""
 
-    for strategy in strategies:
-        context = strategy["context"]
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {"User-Agent": "mac-analyze/1.3"}
+        if api_key:
+            self.headers["apiKey"] = api_key
+        self.delay = get_rate_delay(bool(api_key))
+        self._last_request_time = 0.0
+        self._ssl_context = ssl.create_default_context()
+
+    def _rate_limit(self):
+        """Enforces minimum delay between requests."""
+        now = time.time()
+        elapsed = now - self._last_request_time
+        if elapsed < self.delay:
+            time.sleep(self.delay - elapsed)
+        self._last_request_time = time.time()
+
+    def request_json(self, url: str, params: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        """
+        Performs HTTP GET with retries and exponential backoff.
+        Returns None on complete failure (distinguishable from empty results {}).
+        """
+        query_string = urllib.parse.urlencode(params)
+        full_url = f"{url}?{query_string}"
+        delays = [1.0, 2.0, 4.0]
+
         for attempt in range(MAX_RETRIES + 1):
+            self._rate_limit()
             try:
-                req = urllib.request.Request(full_url, headers=HEADERS)
-                with urllib.request.urlopen(req, context=context, timeout=REQ_TIMEOUT) as response:
+                req = urllib.request.Request(full_url, headers=self.headers)
+                with urllib.request.urlopen(req, context=self._ssl_context, timeout=REQ_TIMEOUT) as response:
                     if response.status == 200:
                         return json.loads(response.read().decode('utf-8'))
                     elif response.status == 429:
+                        # Back off and increase future delays
+                        self.delay = min(self.delay * 1.5, 10.0)
                         time.sleep(delays[min(attempt, 2)])
                         continue
             except urllib.error.HTTPError as e:
+                if e.code == 403:
+                    print(f"\n⚠️  NVD API returned 403 Forbidden — check your API key", file=sys.stderr)
+                    return None
                 if e.code in (429, 500, 502, 503, 504):
+                    if e.code == 429:
+                        self.delay = min(self.delay * 1.5, 10.0)
                     time.sleep(delays[min(attempt, 2)])
                     continue
-                break 
+                return None
             except urllib.error.URLError as e:
                 reason = str(e.reason).lower()
                 if "verify failed" in reason or "certificate" in reason or "ssl" in reason:
-                    # Switch to unverified context
-                    break 
+                    print(f"\n⚠️  SSL verification failed for NVD API. Check your network/proxy.", file=sys.stderr)
+                    return None
                 time.sleep(delays[min(attempt, 2)])
                 continue
             except Exception:
-                break
-    return {}
+                time.sleep(delays[min(attempt, 2)])
+                continue
 
-def search_cves(vendor: str, product: str, version: str) -> List[Dict[str, Any]]:
-    """Query NVD for CVEs using a virtual match string."""
-    params = {
-        "virtualMatchString": f"cpe:2.3:a:{vendor}:{product}",
-        "versionStart": version,
-        "versionStartType": "including",
-        "versionEnd": version,
-        "versionEndType": "including",
-        "resultsPerPage": "100"
-    }
-    data = request_json(BASE_CVE_URL, params)
-    return data.get("vulnerabilities", [])
+        return None  # All retries exhausted
+
+    def search_cves(self, vendor: str, product: str, version: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Query NVD for CVEs using a virtual match string.
+        Returns None on API failure, empty list on no results.
+        """
+        params = {
+            "virtualMatchString": f"cpe:2.3:a:{vendor}:{product}",
+            "versionStart": version,
+            "versionStartType": "including",
+            "versionEnd": version,
+            "versionEndType": "including",
+            "resultsPerPage": "20"
+        }
+        data = self.request_json(BASE_CVE_URL, params)
+        if data is None:
+            return None
+        return data.get("vulnerabilities", [])
+
 
 # ── Analysis Logic ──────────────────────────────────────────────────────────
 
-def analyze_software(name: str, raw_version: str, source: str, path: str) -> Optional[Dict[str, Any]]:
-    """Analyzes a single software item."""
-    if path and (path.startswith("/System/") or path.startswith("/Library/")):
+def extract_cvss(cve_data: Dict[str, Any]) -> Tuple[float, str]:
+    """Extract the best available CVSS score and severity from a CVE entry."""
+    metrics = cve_data.get("metrics", {})
+    for metric_type in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
+        if metric_type in metrics and metrics[metric_type]:
+            cvss_data = metrics[metric_type][0].get("cvssData", {})
+            score = cvss_data.get("baseScore", 0.0)
+            severity = cvss_data.get("baseSeverity", "UNKNOWN")
+            return score, severity
+    return 0.0, "NONE"
+
+def validate_cve_relevance(cve_data: Dict[str, Any], product: str, version: str) -> bool:
+    """
+    Validates that a CVE is actually relevant to the specific product+version.
+    Reduces false positives by checking CPE match criteria in the CVE itself.
+    """
+    configurations = cve_data.get("configurations", [])
+    if not configurations:
+        # No configuration data to verify — keep the result (conservative)
+        return True
+
+    norm_product = product.lower().replace("-", "_")
+
+    for config in configurations:
+        for node in config.get("nodes", []):
+            for cpe_match in node.get("cpeMatch", []):
+                cpe_str = cpe_match.get("criteria", "").lower()
+                # Check if the CPE string contains our product name
+                if norm_product in cpe_str or product in cpe_str:
+                    return True
+
+    return False
+
+def analyze_software(client: NVDClient, name: str, raw_version: str,
+                     source: str, path: str) -> Optional[Dict[str, Any]]:
+    """Analyzes a single software item for known vulnerabilities."""
+    # Skip system software early (before any API calls)
+    if is_system_software(name, path):
         return None
 
     norm_n = normalize_name(name)
     norm_v = normalize_version(raw_version)
-    
-    parts = norm_n.split('_')
-    vendor = parts[0] if parts else "unknown"
+
+    # Skip if we couldn't extract a meaningful version
+    if not norm_v or not re.search(r"\d", norm_v):
+        return None
+
+    # Determine vendor: use known mapping first, fall back to first word
+    vendor = KNOWN_VENDORS.get(norm_n)
+    if not vendor:
+        parts = norm_n.split('_')
+        vendor = parts[0] if parts else "unknown"
+
     product = norm_n
-    
     aliases = get_product_aliases(vendor, product)
+
     vulns = []
-    
-    for alias in aliases:
-        found_vulns = search_cves(vendor, alias, norm_v)
-        if found_vulns:
-            vulns = found_vulns
-            product = alias
-            break
-        found_vulns = search_cves("*", alias, norm_v)
-        if found_vulns:
-            vulns = found_vulns
-            vendor = "*"
-            product = alias
+    matched_vendor = vendor
+    matched_product = product
+    api_failed = False
+
+    for v, p in aliases:
+        result = client.search_cves(v, p, norm_v)
+        if result is None:
+            api_failed = True
+            continue
+        if result:
+            vulns = result
+            matched_vendor = v
+            matched_product = p
             break
 
+    # If all API calls failed, skip silently (don't report as clean)
+    if not vulns and api_failed:
+        return None
+
+    # Filter CVEs for actual relevance to reduce false positives
     cve_ids = []
     max_score = 0.0
     severity = "NONE"
-    
+
     for item in vulns:
         cve = item.get("cve", {})
-        cve_ids.append(cve.get("id"))
-        
-        metrics = cve.get("metrics", {})
-        cvss_data = None
-        for metric_type in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
-            if metric_type in metrics:
-                cvss_data = metrics[metric_type][0].get("cvssData", {})
-                break
-        
-        if cvss_data:
-            score = cvss_data.get("baseScore", 0.0)
-            if score > max_score:
-                max_score = score
-                severity = cvss_data.get("baseSeverity", "UNKNOWN")
+        cve_id = cve.get("id")
+        if not cve_id:
+            continue
+
+        # Validate that this CVE actually applies to our product
+        if not validate_cve_relevance(cve, matched_product, norm_v):
+            continue
+
+        cve_ids.append(cve_id)
+        score, sev = extract_cvss(cve)
+        if score > max_score:
+            max_score = score
+            severity = sev
+
+    if not cve_ids:
+        return None
 
     return {
         "software": name,
         "version": raw_version,
         "source": source,
-        "normalized_product": product,
+        "normalized_product": matched_product,
         "normalized_version": norm_v,
         "cve_count": len(cve_ids),
         "max_cvss": max_score,
         "severity": severity,
-        "cve_list": ";".join(cve_ids[:5])
+        "cve_list": ";".join(cve_ids[:10])
     }
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -197,46 +430,87 @@ def main():
     except Exception as e:
         sys.exit(f"Error reading JSON: {e}")
 
-    software_map = {}
+    # Load API key
+    api_key = load_api_key()
+    if api_key:
+        print("✓ NVD API key loaded (higher rate limit)")
+    else:
+        print("⚠️  No NVD API key found — using public rate limit (slower)")
+        print("  Set NVD_API_KEY in .env or as environment variable")
+
+    client = NVDClient(api_key)
+
+    # Deduplicate software items
+    software_map: Dict[Tuple, str] = {}
     for app in data.get("data", {}).get("apps", []):
         key = (app.get("name"), app.get("version"), app.get("path"))
-        if key not in software_map: software_map[key] = "Application"
+        if key not in software_map:
+            software_map[key] = "Application"
     for pkg in data.get("data", {}).get("homebrew_packages", []):
         key = (pkg.get("name"), pkg.get("version"), pkg.get("path"))
-        if key not in software_map: software_map[key] = "Homebrew"
+        if key not in software_map:
+            software_map[key] = "Homebrew"
 
-    total = len(software_map)
-    results = []
-    
-    print(f"Analyzing {total} unique software items...")
-    print(f"Checking NVD (approx 0.6s per item)...")
-    
-    count = 0
+    # Pre-filter system software before counting
+    filtered_items = []
     for (name, ver, path), source in software_map.items():
-        count += 1
-        sys.stdout.write(f"\r[{count}/{total}] Checking {name} v{ver}...")
+        if not is_system_software(name or "", path or ""):
+            filtered_items.append((name, ver, path, source))
+
+    total = len(filtered_items)
+    results = []
+    api_errors = 0
+    skipped = len(software_map) - total
+
+    print(f"\nAnalyzing {total} user-installed software items ({skipped} system items skipped)")
+    delay_str = f"{client.delay:.1f}s"
+    est_minutes = (total * client.delay) / 60
+    print(f"Rate limit delay: {delay_str}/request (est. {est_minutes:.0f} min)")
+    print()
+
+    start_time = time.time()
+
+    for i, (name, ver, path, source) in enumerate(filtered_items, 1):
+        elapsed = time.time() - start_time
+        found_so_far = len(results)
+        sys.stdout.write(
+            f"\r[{i}/{total}] {name} v{ver}"
+            f"  |  ⏱ {elapsed:.0f}s  |  🛡️ {found_so_far} vulns found"
+            + " " * 20  # clear trailing chars
+        )
         sys.stdout.flush()
-        
-        time.sleep(BASE_DELAY)
-        
+
         try:
-            res = analyze_software(name, ver, source, path)
-            if res and res['cve_count'] > 0:
-                 results.append(res)
-        except Exception:
+            res = analyze_software(client, name, ver, source, path or "")
+            if res:
+                results.append(res)
+        except KeyboardInterrupt:
+            print(f"\n\nScan interrupted at item {i}/{total}.")
+            break
+        except Exception as e:
+            api_errors += 1
+            print(f"\n⚠️  Error analyzing {name}: {e}", file=sys.stderr)
             continue
-            
-    print("\n\nAnalysis complete.")
-    
-    fieldnames = ["software", "version", "source", "normalized_product", "normalized_version", "cve_count", "max_cvss", "severity", "cve_list"]
-    
+
+    elapsed_total = time.time() - start_time
+    print(f"\n\nAnalysis complete in {elapsed_total:.0f}s")
+
+    if api_errors > 0:
+        print(f"⚠️  {api_errors} items had API errors and were skipped")
+
+    # Sort results by severity (highest CVSS first)
+    results.sort(key=lambda r: r["max_cvss"], reverse=True)
+
+    fieldnames = ["software", "version", "source", "normalized_product",
+                  "normalized_version", "cve_count", "max_cvss", "severity", "cve_list"]
+
     try:
         with open(args.output, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(results)
-        print(f"Report saved to: {args.output}")
-        print(f"Vulnerable items found: {len(results)}")
+        print(f"\n📄 Report saved to: {args.output}")
+        print(f"🛡️  Vulnerable items found: {len(results)}")
     except Exception as e:
         sys.exit(f"Error writing CSV: {e}")
 

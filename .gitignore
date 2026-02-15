@@ -1,6 +1,12 @@
 # Output files
 osq_out/
-*.json
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
 
 # macOS junk
 .DS_Store
@@ -15,5 +21,7 @@ Icon?
 *~
 .idea/
 .vscode/
+.ruby-lsp/
 tap-repo/
 docs
+__pycache__

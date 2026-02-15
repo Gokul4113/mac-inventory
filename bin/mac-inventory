@@ -46,8 +46,12 @@ parse_args() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -o|--output) OUT_DIR="$2"; shift 2 ;;
-      -f|--format) OUTPUT_FORMAT="$2"; shift 2 ;;
+      -o|--output)
+        [[ -z "${2:-}" ]] && { red "ERROR: --output requires a directory path"; exit 1; }
+        OUT_DIR="$2"; shift 2 ;;
+      -f|--format)
+        [[ -z "${2:-}" ]] && { red "ERROR: --format requires a value (json, csv, or all)"; exit 1; }
+        OUTPUT_FORMAT="$2"; shift 2 ;;
       -s|--scan)   RUN_SCAN=true; shift ;;
       -v|--version) echo "${PROGRAM_NAME} ${VERSION}"; exit 0 ;;
       -h|--help) usage; exit 0 ;;
