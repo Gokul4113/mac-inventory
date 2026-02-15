@@ -23,6 +23,7 @@ OPTIONS
   -o, --output DIR       Output directory (default: ./osq_out)
   -f, --format FORMAT    Output format: json, csv, or all (default: json)
   -s, --scan             Run vulnerability scan (checks NVD for CVEs)
+  --scan-json            Run scan AND export detailed JSON report
   -v, --version          Print version and exit
   -h, --help             Show this help message
 
@@ -43,6 +44,7 @@ parse_args() {
   OUT_DIR="./osq_out"
   OUTPUT_FORMAT="json"
   RUN_SCAN=false
+  SCAN_JSON=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -53,6 +55,7 @@ parse_args() {
         [[ -z "${2:-}" ]] && { red "ERROR: --format requires a value (json, csv, or all)"; exit 1; }
         OUTPUT_FORMAT="$2"; shift 2 ;;
       -s|--scan)   RUN_SCAN=true; shift ;;
+      --scan-json) RUN_SCAN=true; SCAN_JSON=true; shift ;;
       -v|--version) echo "${PROGRAM_NAME} ${VERSION}"; exit 0 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown option: $1"; usage; exit 1 ;;
@@ -284,9 +287,13 @@ run_scan() {
     return
   fi
 
-  python3 "$analyzer" \
-    --input "${OUT_DIR}/final_inventory.json" \
-    --output "$output_csv"
+  local cmd=("python3" "$analyzer" "--input" "${OUT_DIR}/final_inventory.json" "--output" "$output_csv")
+  
+  if [[ "$SCAN_JSON" == "true" ]]; then
+    cmd+=("--json" "${OUT_DIR}/security_audit.json")
+  fi
+  
+  "${cmd[@]}"
 }
 
 # ── Summary Reporter ──
@@ -318,6 +325,9 @@ print_summary() {
   if [[ "$RUN_SCAN" == "true" ]]; then
     echo ""
     info "Security Audit:   ${OUT_DIR}/security_audit.csv"
+    if [[ "$SCAN_JSON" == "true" ]]; then
+        info "Security JSON:    ${OUT_DIR}/security_audit.json"
+    fi
   fi
   
   info "Host:             ${HOST}"

@@ -34,6 +34,7 @@ mac-inventory [OPTIONS]
 | `-o, --output DIR` | Specify output directory (default: `./osq_out`) |
 | `-f, --format FMT` | Output format: `json` (default), `csv`, or `all` |
 | `-s, --scan`       | **New:** Run vulnerability scan against NVD (Internet required) |
+| `--scan-json`      | Run scan AND export detailed JSON report |
 | `-v, --version`    | Show version |
 | `-h, --help`       | Show help message |
 
