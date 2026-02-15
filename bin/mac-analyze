@@ -2,70 +2,92 @@
 """
 mac-analyze
 -----------
-Scans mac-inventory JSON output for potential vulnerabilities using the NVD API.
+Vulnerability scanner for macOS inventory data.
+
+Features:
+- Resolves CPE names via NVD CPE API (cpes/2.0) with strict validation.
+- Fetches all CVEs using pagination.
+- Tags CISA KEV (Known Exploited Vulnerabilities).
+- Scans both Applications and Package Receipts.
+- Implements strict confidence scoring to minimize false positives.
+
+Usage:
+    mac-analyze -i <inventory_json> -o <output_csv> [--kev]
+
+Requires:
+- python3
+- network access to NVD API
+
+Configuration:
+- Set NVD_API_KEY env var or add to .env file for higher rate limits.
 """
 
-import json
+import argparse
 import csv
-import sys
+import json
 import os
 import re
+import ssl
+import sys
 import time
-import argparse
-import urllib.request
 import urllib.error
 import urllib.parse
-import ssl
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-# ── Config ──────────────────────────────────────────────────────────────────
-
-def load_api_key() -> str:
-    """Load NVD API key from environment variable or .env file."""
-    # 1. Check environment variable first
-    key = os.environ.get("NVD_API_KEY", "").strip()
-    if key:
-        return key
-
-    # 2. Search for .env file (script dir → parent → cwd)
-    search_dirs = [
-        Path(__file__).resolve().parent.parent,  # project root
-        Path(__file__).resolve().parent,          # bin/
-        Path.cwd(),                               # current directory
-    ]
-    for d in search_dirs:
-        env_file = d / ".env"
-        if env_file.is_file():
-            try:
-                for line in env_file.read_text().splitlines():
-                    line = line.strip()
-                    if line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    if k.strip() == "NVD_API_KEY":
-                        return v.strip()
-            except OSError:
-                continue
-
-    return ""
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
 
 BASE_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-REQ_TIMEOUT = 15
+BASE_CPE_URL = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
+KEV_URL_DEFAULT = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+REQ_TIMEOUT = 20
 MAX_RETRIES = 3
+
+# NVD max resultsPerPage is high (commonly 2000). Use 2000 to reduce paging requests.
+CVE_RESULTS_PER_PAGE = 2000
+CPE_RESULTS_PER_PAGE = 200
 
 # Without API key: 5 req/30s (~6s delay); With key: 50 req/30s (~0.6s delay)
 def get_rate_delay(has_key: bool) -> float:
     return 0.6 if has_key else 6.0
 
-# ── Known Vendor Mappings ───────────────────────────────────────────────────
-# Maps normalized product names to their correct CPE vendor strings.
-# This dramatically reduces false positives from naive first-word guessing.
+# System paths to skip — OS-managed; creates lots of false positives.
+SYSTEM_PATH_PREFIXES = (
+    "/System/",
+    "/Library/Apple/",
+    "/usr/libexec/",
+    "/usr/sbin/",
+    "/usr/bin/",
+    "/bin/",
+    "/sbin/",
+)
 
-KNOWN_VENDORS: Dict[str, str] = {
+# Known Apple system apps by normalized name (OS-managed)
+APPLE_SYSTEM_APPS = {
+    "finder", "safari", "mail", "calendar", "contacts", "notes", "reminders",
+    "messages", "facetime", "maps", "photos", "preview", "music", "tv",
+    "podcasts", "news", "stocks", "home", "voice_memos", "books",
+    "font_book", "keychain_access", "disk_utility", "activity_monitor",
+    "console", "terminal", "migration_assistant", "boot_camp_assistant",
+    "bluetooth_file_exchange", "audio_midi_setup", "colorsync_utility",
+    "digital_color_meter", "grapher", "screenshot", "system_information",
+    "system_preferences", "system_settings", "time_machine", "automator",
+    "script_editor", "siri", "dictionary", "chess", "stickies",
+    "photo_booth", "quicktime_player", "textedit", "archive_utility",
+    "installer", "directory_utility", "airport_utility",
+    "garageband", "imovie", "keynote", "numbers", "pages",
+}
+
+# Known vendor mappings (reduce wrong vendor guesses)
+KNOWN_VENDORS = {
     # Browsers
     "google_chrome": "google",
+    "chrome": "google",
     "firefox": "mozilla",
     "mozilla_firefox": "mozilla",
     "brave_browser": "brave",
@@ -130,35 +152,7 @@ KNOWN_VENDORS: Dict[str, str] = {
     "pgadmin": "pgadmin",
 }
 
-# System paths to always skip — these are OS-managed and create false positives
-SYSTEM_PATH_PREFIXES = (
-    "/System/",
-    "/Library/Apple/",
-    "/usr/libexec/",
-    "/usr/sbin/",
-    "/usr/bin/",
-    "/bin/",
-    "/sbin/",
-)
-
-# Known Apple system apps to skip (names that live under /Applications but are OS-managed)
-APPLE_SYSTEM_APPS = {
-    "finder", "safari", "mail", "calendar", "contacts", "notes", "reminders",
-    "messages", "facetime", "maps", "photos", "preview", "music", "tv",
-    "podcasts", "news", "stocks", "home", "voice_memos", "books",
-    "font_book", "keychain_access", "disk_utility", "activity_monitor",
-    "console", "terminal", "migration_assistant", "boot_camp_assistant",
-    "bluetooth_file_exchange", "audio_midi_setup", "colorsync_utility",
-    "digital_color_meter", "grapher", "screenshot", "system_information",
-    "system_preferences", "system_settings", "time_machine", "automator",
-    "script_editor", "siri", "dictionary", "chess", "stickies",
-    "photo_booth", "quicktime_player", "textedit", "archive_utility",
-    "installer", "directory_utility", "airport_utility",
-}
-
-
-# Suffixes commonly found in app names but absent from CPE product strings.
-# Used to generate aliases — the original normalized name is always tried first.
+# Suffixes commonly found in app names but absent from CPE product strings
 STRIP_SUFFIXES = [
     "_for_macos", "_for_mac", "_for_os_x",
     "_desktop", "_browser", "_client", "_app",
@@ -167,22 +161,41 @@ STRIP_SUFFIXES = [
     "_ce", "_pro", "_free", "_lite",
 ]
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+VERSION_TOKEN = re.compile(r"\d+(?:[._-]\d+){0,8}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_api_key() -> str:
+    """Load NVD API key from env var or .env file."""
+    key = os.environ.get("NVD_API_KEY", "").strip()
+    if key:
+        return key
+
+    search_dirs = [
+        Path(__file__).resolve().parent.parent,  # project root
+        Path(__file__).resolve().parent,         # bin/
+        Path.cwd(),                              # cwd
+    ]
+    for d in search_dirs:
+        env_file = d / ".env"
+        if env_file.is_file():
+            try:
+                for line in env_file.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == "NVD_API_KEY":
+                        return v.strip()
+            except OSError:
+                continue
+
+    return ""
 
 def normalize_name(s: str) -> str:
-    """
-    Cleans up software names for better CPE matching.
-    
-    Pipeline:
-      1. Lowercase, strip .app suffix
-      2. Replace special chars (& → and, + → plus)
-      3. Normalize whitespace/separators to underscores
-      4. Strip trailing version numbers ("Xcode 15" → "xcode")
-      5. Strip trailing edition labels ("Pro", "Community", etc.)
-      6. Clean residual underscores
-    
-    The original name is always preserved in the output for traceability.
-    """
+    """Normalize names to something CPE-ish."""
     s = (s or "").strip().lower()
     s = re.sub(r"\.app$", "", s)
     s = s.replace("&", "and").replace("+", "plus")
@@ -191,8 +204,7 @@ def normalize_name(s: str) -> str:
     s = re.sub(r"[^a-z0-9._-]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
 
-    # Strip trailing version numbers: "1password_7" → "1password"
-    # But preserve versions that ARE the name: "7-zip" stays
+    # Strip trailing version "foo_1.2.3" -> "foo" (but keep "7-zip" style)
     stripped = re.sub(r"[_.]\d+(\.\d+)*$", "", s)
     if stripped and len(stripped) > 1:
         s = stripped
@@ -200,100 +212,228 @@ def normalize_name(s: str) -> str:
     return s
 
 def normalize_version(v: str) -> str:
-    """
-    Extracts a clean semantic version.
-    Handles: "1.2.3", "v1.2.3", "Version 1.2", "build 1234", single "5".
-    """
+    """Extract clean version token where possible."""
     v = (v or "").strip()
     if not v:
         return ""
+
     v = re.sub(r"^(?:version|ver|v)\s*[:=_-]?\s*", "", v, flags=re.I)
-    # Try multi-part version first: "1.2.3"
-    match = re.search(r"\d+(?:\.\d+)+", v)
-    if match:
-        return match.group(0)
-    # Accept single integer version: "5" (common for major-only versioning)
-    match = re.search(r"^\d+$", v)
-    if match:
-        return match.group(0)
+    v = v.replace("_", ".").replace("-", ".").strip()
+
+    m = re.search(r"\d+(?:\.\d+)+", v)
+    if m:
+        return m.group(0)
+
+    m = re.search(r"^\d+$", v)
+    if m:
+        return m.group(0)
+
+    # Last-resort token extraction
+    m = VERSION_TOKEN.search(v)
+    if m:
+        return m.group(0).replace("_", ".").replace("-", ".")
+
     return v
 
 def is_system_software(name: str, path: str) -> bool:
-    """Determines if software is OS-managed and should be skipped."""
-    # Check path prefixes
+    """Skip OS-managed software to reduce false positives."""
     if path:
         for prefix in SYSTEM_PATH_PREFIXES:
             if path.startswith(prefix):
                 return True
-        # /Library/ top-level is system-managed (but /Library is already covered)
         if path.startswith("/Library/") and not path.startswith("/Library/Application Support/"):
             return True
 
-    # Check known Apple apps by normalized name
     norm = normalize_name(name)
-    if norm in APPLE_SYSTEM_APPS:
-        return True
-
-    return False
+    return norm in APPLE_SYSTEM_APPS
 
 def get_product_aliases(vendor: str, product: str) -> List[Tuple[str, str]]:
-    """
-    Returns list of (vendor, product) pairs to try for CPE matching.
-    
-    Strategy (ordered from most to least specific):
-      1. Exact (vendor, product)
-      2. Vendor-prefix stripped: (google, google_chrome) → (google, chrome)
-      3. Suffix-stripped variants: (vendor, docker_desktop) → (vendor, docker)
-      4. Wildcard vendor as last resort
-    
-    The original name always goes first to preserve data integrity.
-    """
+    """Generate alias vendor/product pairs to try for CPE lookup."""
     pairs = [(vendor, product)]
 
-    # Try without vendor prefix: "google_chrome" → "chrome"
     if product.startswith(f"{vendor}_") and len(product) > len(vendor) + 1:
-        stripped = product[len(vendor)+1:]
-        if stripped:  # safety check
-            pairs.append((vendor, stripped))
+        pairs.append((vendor, product[len(vendor)+1:]))
 
-    # Try stripping common suffixes: "brave_browser" → "brave"
     for suffix in STRIP_SUFFIXES:
         if product.endswith(suffix) and len(product) > len(suffix):
             base = product[:-len(suffix)]
-            if base and len(base) > 1:  # don't reduce to single char
+            if base and len(base) > 1:
                 pairs.append((vendor, base))
-                # Also try with wildcard vendor
                 pairs.append(("*", base))
-            break  # only strip one suffix
+            break
 
-    # Try wildcard vendor with original product as last resort
     pairs.append(("*", product))
 
-    # Deduplicate while preserving order
     seen = set()
-    unique = []
-    for pair in pairs:
-        if pair not in seen:
-            seen.add(pair)
-            unique.append(pair)
-    return unique
+    out = []
+    for p in pairs:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
 
-# ── API Client ──────────────────────────────────────────────────────────────
+def parse_cpe23(cpe: str) -> Tuple[str, str, str, str]:
+    """
+    Parse cpe:2.3:<part>:<vendor>:<product>:<version>:...
+    Returns (part, vendor, product, version) or ("","","","") if not parseable.
+    """
+    if not cpe or not cpe.startswith("cpe:2.3:"):
+        return ("", "", "", "")
+    parts = cpe.split(":")
+    if len(parts) < 6:
+        return ("", "", "", "")
+    return (parts[2], parts[3], parts[4], parts[5])
+
+def version_tuple(v: str) -> Tuple[int, ...]:
+    """
+    Convert "1.2.10" -> (1,2,10) for comparisons.
+    If non-numeric, returns empty tuple.
+    """
+    if not v or not re.search(r"\d", v):
+        return tuple()
+    chunks = re.split(r"[._-]", v)
+    out = []
+    for c in chunks:
+        if c.isdigit():
+            out.append(int(c))
+        else:
+            # stop at first non-numeric chunk to avoid garbage comparisons
+            break
+    return tuple(out)
+
+def version_in_range(
+    v: str,
+    start_incl: Optional[str],
+    start_excl: Optional[str],
+    end_incl: Optional[str],
+    end_excl: Optional[str],
+) -> bool:
+    """
+    Determine if version v fits [startIncl, endIncl] with exclusives.
+    If no bounds present, return True (can't disprove).
+    """
+    vt = version_tuple(v)
+    if not vt:
+        return True
+
+    def ge(a, b): return a >= b
+    def gt(a, b): return a > b
+    def le(a, b): return a <= b
+    def lt(a, b): return a < b
+
+    if start_incl:
+        st = version_tuple(start_incl)
+        if st and not ge(vt, st):
+            return False
+    if start_excl:
+        st = version_tuple(start_excl)
+        if st and not gt(vt, st):
+            return False
+    if end_incl:
+        et = version_tuple(end_incl)
+        if et and not le(vt, et):
+            return False
+    if end_excl:
+        et = version_tuple(end_excl)
+        if et and not lt(vt, et):
+            return False
+    return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NVD Client (CPE + CVE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Production-Grade CPE Validator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StrictCPEValidator:
+    """
+    Enforces strict matching rules to eliminate "Name Collision" false positives.
+    - Preventing 'jq' from matching 'jquery' (token mismatch).
+    - Preventing 'm4' from matching 'activemq' (embedded string).
+    - Enforcing vendor consistency for known tools.
+    """
+
+    # Known bad pairings to block explicit false positives (Legacy safety net)
+    BLOCKLIST = {
+        "jq": {"jquery", "jquery_ui", "activemq"},
+        "m4": {"activemq", "m4v_converter"},
+        "zed": {"primx", "hacker_contest"}, 
+    }
+
+    # Strict vendor requirements. If key exists, CPE vendor MUST match value.
+    REQUIRED_VENDORS = {
+        "jq": "stedolan",
+        "m4": "gnu",
+        "zed": {"zed_industries", "atom"}, # Zed editor
+        "python": "python_software_foundation",
+        "node": "nodejs",
+        "go": "golang",
+        "ruby": "ruby-lang",
+    }
+
+    @staticmethod
+    def get_tokens(s: str) -> set:
+        """Split string into distinct alphanumeric tokens."""
+        return set(re.split(r"[^a-z0-9]+", s.lower()))
+
+    @classmethod
+    def validate(cls, software_name: str, cpe_vendor: str, cpe_product: str) -> bool:
+        sw = normalize_name(software_name).lower()
+        vp = cpe_vendor.lower()
+        pp = cpe_product.lower()
+
+        # 1. Blocklist Check
+        if sw in cls.BLOCKLIST and pp in cls.BLOCKLIST[sw]:
+            return False
+
+        # 2. Required Vendor Check
+        if sw in cls.REQUIRED_VENDORS:
+            req = cls.REQUIRED_VENDORS[sw]
+            if isinstance(req, str):
+                if vp != req: return False
+            elif isinstance(req, set):
+                if vp not in req: return False
+
+        # 3. Strict Token Matching (The "Anti-jq/jquery" Rule)
+        # For short names (< 4 chars), the software name MUST appear as a distinct whole word
+        # in the CPE product. "jq" is NOT a distinct word in "jquery".
+        if len(sw) < 4:
+            cpe_tokens = cls.get_tokens(pp)
+            # Special case: "go" -> "golang" alias is allowed
+            if sw == "go" and "golang" in cpe_tokens:
+                return True
+            
+            # General case: exact token required
+            if sw not in cpe_tokens:
+                # One exception: if the CPE product IS exactly the software name (ignoring special chars)
+                # e.g. software="m4", product="m4" -> pass
+                if pp != sw:
+                    return False
+
+        return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NVD Client (CPE + CVE)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class NVDClient:
-    """Handles NVD API communication with proper rate limiting and retries."""
+    """Handles NVD API communication with rate limiting, retries, and basic caching."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.headers = {"User-Agent": "mac-analyze/1.3"}
+        # ... (rest of init)
+        self.headers = {"User-Agent": "mac-analyze/2.0"}
         if api_key:
             self.headers["apiKey"] = api_key
         self.delay = get_rate_delay(bool(api_key))
         self._last_request_time = 0.0
         self._ssl_context = ssl.create_default_context()
+        self._cache: Dict[str, Any] = {}
 
     def _rate_limit(self):
-        """Enforces minimum delay between requests."""
+        # ... (same as before)
         now = time.time()
         elapsed = now - self._last_request_time
         if elapsed < self.delay:
@@ -301,275 +441,524 @@ class NVDClient:
         self._last_request_time = time.time()
 
     def request_json(self, url: str, params: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """
-        Performs HTTP GET with retries and exponential backoff.
-        Returns None on complete failure (distinguishable from empty results {}).
-        """
+        # ... (same as before)
         query_string = urllib.parse.urlencode(params)
         full_url = f"{url}?{query_string}"
-        delays = [1.0, 2.0, 4.0]
+
+        if full_url in self._cache:
+            return self._cache[full_url]
+
+        backoffs = [1.0, 2.0, 4.0]
 
         for attempt in range(MAX_RETRIES + 1):
             self._rate_limit()
             try:
                 req = urllib.request.Request(full_url, headers=self.headers)
-                with urllib.request.urlopen(req, context=self._ssl_context, timeout=REQ_TIMEOUT) as response:
-                    if response.status == 200:
-                        return json.loads(response.read().decode('utf-8'))
-                    elif response.status == 429:
-                        # Back off and increase future delays
+                with urllib.request.urlopen(req, context=self._ssl_context, timeout=REQ_TIMEOUT) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        self._cache[full_url] = data
+                        return data
+                    if resp.status == 429:
                         self.delay = min(self.delay * 1.5, 10.0)
-                        time.sleep(delays[min(attempt, 2)])
+                        time.sleep(backoffs[min(attempt, 2)])
                         continue
+                    return None
             except urllib.error.HTTPError as e:
+                # ... (error handling)
                 if e.code == 403:
-                    print(f"\n⚠️  NVD API returned 403 Forbidden — check your API key", file=sys.stderr)
+                    print("\n⚠️  NVD API 403 Forbidden — check API key", file=sys.stderr)
                     return None
                 if e.code in (429, 500, 502, 503, 504):
                     if e.code == 429:
                         self.delay = min(self.delay * 1.5, 10.0)
-                    time.sleep(delays[min(attempt, 2)])
+                    time.sleep(backoffs[min(attempt, 2)])
                     continue
                 return None
-            except urllib.error.URLError as e:
-                reason = str(e.reason).lower()
-                if "verify failed" in reason or "certificate" in reason or "ssl" in reason:
-                    print(f"\n⚠️  SSL verification failed for NVD API. Check your network/proxy.", file=sys.stderr)
-                    return None
-                time.sleep(delays[min(attempt, 2)])
-                continue
             except Exception:
-                time.sleep(delays[min(attempt, 2)])
+                time.sleep(backoffs[min(attempt, 2)])
                 continue
+        return None
 
-        return None  # All retries exhausted
+    # ── CPE resolution ───────────────────────────────────────────────────────
 
-    def search_cves(self, vendor: str, product: str, version: str) -> Optional[List[Dict[str, Any]]]:
+    def search_cpes(self, vendor: str, product: str, original_software_name: str, max_cpes: int = 5) -> Optional[List[str]]:
         """
-        Query NVD for CVEs using a virtual match string.
-        Returns None on API failure, empty list on no results.
+        Resolve possible CPE names via NVD CPE API.
+        Returns list of cpeName strings or None on API failure.
         """
+        keyword_terms = product if vendor == "*" else f"{vendor} {product}"
+
         params = {
-            "virtualMatchString": f"cpe:2.3:a:{vendor}:{product}",
-            "versionStart": version,
-            "versionStartType": "including",
-            "versionEnd": version,
-            "versionEndType": "including",
-            "resultsPerPage": "20"
+            "keywordSearch": keyword_terms,
+            "resultsPerPage": str(CPE_RESULTS_PER_PAGE),
         }
-        data = self.request_json(BASE_CVE_URL, params)
+
+        data = self.request_json(BASE_CPE_URL, params)
         if data is None:
             return None
-        return data.get("vulnerabilities", [])
 
+        products = data.get("products", []) or []
+        candidates: List[Tuple[int, str]] = []
 
-# ── Analysis Logic ──────────────────────────────────────────────────────────
+        # Scoring: prefer exact match + Validation
+        for entry in products:
+            cpe_obj = entry.get("cpe", {})
+            cpe_name = cpe_obj.get("cpeName", "")
+            if not cpe_name.startswith("cpe:2.3:"):
+                continue
+
+            part, vndr, prod, _ver = parse_cpe23(cpe_name)
+
+            # PRODUCTION GRADE VALIDATION (Step B: Map -> Best CPE)
+            if not StrictCPEValidator.validate(original_software_name, vndr, prod):
+                continue
+            
+            # prefer application part
+            score = 0
+            if part == "a":
+                score += 3
+            if vendor != "*" and vndr == vendor:
+                score += 6
+            if prod == product:
+                score += 6
+            # partial token overlap
+            if vendor != "*" and vendor in cpe_name:
+                score += 2
+            if product in cpe_name:
+                score += 2
+
+            # De-prioritize obviously generic vendor/product
+            if vndr in ("unknown", "generic") or prod in ("unknown", "generic"):
+                score -= 4
+
+            candidates.append((score, cpe_name))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        out: List[str] = []
+        seen = set()
+        for _score, c in candidates:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+            if len(out) >= max_cpes:
+                break
+
+        return out
+
+    # ── CVE fetching with paging ─────────────────────────────────────────────
+
+    def fetch_all_cves_for_cpe(self, cpe_name: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch all vulnerabilities for a specific cpeName using paging.
+        Returns list of vulnerabilities[] items, None on API failure.
+        """
+        start_index = 0
+        all_vulns: List[Dict[str, Any]] = []
+
+        while True:
+            params = {
+                "cpeName": cpe_name,
+                "resultsPerPage": str(CVE_RESULTS_PER_PAGE),
+                "startIndex": str(start_index),
+            }
+            data = self.request_json(BASE_CVE_URL, params)
+            if data is None:
+                return None
+
+            vulns = data.get("vulnerabilities", []) or []
+            all_vulns.extend(vulns)
+
+            total = int(data.get("totalResults", len(all_vulns)) or len(all_vulns))
+            start_index += CVE_RESULTS_PER_PAGE
+
+            if len(all_vulns) >= total or not vulns:
+                break
+
+        return all_vulns
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KEV (optional)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_kev_set(kev_url: str) -> Optional[set]:
+    """Download KEV feed and build a set of CVE IDs."""
+    try:
+        req = urllib.request.Request(kev_url, headers={"User-Agent": "mac-analyze/2.0"})
+        with urllib.request.urlopen(req, timeout=REQ_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    vulns = data.get("vulnerabilities", []) or []
+    s = set()
+    for v in vulns:
+        c = v.get("cveID") or v.get("cve") or ""
+        if isinstance(c, str) and c.startswith("CVE-"):
+            s.add(c.strip())
+    return s
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CVE relevance / scoring (reduce false positives)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_cvss(cve_data: Dict[str, Any]) -> Tuple[float, str]:
-    """Extract the best available CVSS score and severity from a CVE entry."""
-    metrics = cve_data.get("metrics", {})
-    for metric_type in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
-        if metric_type in metrics and metrics[metric_type]:
-            cvss_data = metrics[metric_type][0].get("cvssData", {})
-            score = cvss_data.get("baseScore", 0.0)
-            severity = cvss_data.get("baseSeverity", "UNKNOWN")
+    """Get best available CVSS score + severity."""
+    metrics = cve_data.get("metrics", {}) or {}
+    for metric_type in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        arr = metrics.get(metric_type)
+        if arr:
+            cvss_data = (arr[0] or {}).get("cvssData", {}) or {}
+            score = float(cvss_data.get("baseScore", 0.0) or 0.0)
+            severity = str(cvss_data.get("baseSeverity", "UNKNOWN") or "UNKNOWN")
             return score, severity
     return 0.0, "NONE"
 
-def validate_cve_relevance(cve_data: Dict[str, Any], product: str, version: str) -> bool:
+def cve_matches_cpe_and_version(cve: Dict[str, Any], matched_cpe: str, target_version: str) -> bool:
     """
-    Validates that a CVE is actually relevant to the specific product+version.
-    Reduces false positives by checking CPE match criteria in the CVE itself.
+    Strong relevance check:
+    - If the CVE provides configurations, require at least one cpeMatch criteria to match our vendor/product,
+      and when bounds exist, ensure target_version lies inside the range.
     """
-    configurations = cve_data.get("configurations", [])
-    if not configurations:
-        # No configuration data to verify — keep the result (conservative)
+    configs = cve.get("configurations", []) or []
+    if not configs:
+        # can't verify; keep conservative
         return True
 
-    norm_product = product.lower().replace("-", "_")
+    _part, want_vendor, want_product, _ = parse_cpe23(matched_cpe)
+    want_vendor = (want_vendor or "").lower()
+    want_product = (want_product or "").lower()
+    tv = normalize_version(target_version).lower()
 
-    for config in configurations:
-        for node in config.get("nodes", []):
-            for cpe_match in node.get("cpeMatch", []):
-                cpe_str = cpe_match.get("criteria", "").lower()
-                # Check if the CPE string contains our product name
-                if norm_product in cpe_str or product in cpe_str:
-                    return True
+    for conf in configs:
+        for node in (conf.get("nodes", []) or []):
+            for m in (node.get("cpeMatch", []) or []):
+                criteria = str(m.get("criteria", "") or "").lower()
+                if not criteria.startswith("cpe:2.3:"):
+                    continue
+
+                _p, vndr, prod, _ver = parse_cpe23(criteria)
+                if vndr.lower() != want_vendor or prod.lower() != want_product:
+                    continue
+
+                # If any bounds exist, validate target version against them.
+                if any(k in m for k in ("versionStartIncluding", "versionStartExcluding", "versionEndIncluding", "versionEndExcluding")):
+                    if not tv:
+                        # no target version => can't validate; allow
+                        return True
+
+                    if version_in_range(
+                        tv,
+                        m.get("versionStartIncluding"),
+                        m.get("versionStartExcluding"),
+                        m.get("versionEndIncluding"),
+                        m.get("versionEndExcluding"),
+                    ):
+                        return True
+                    else:
+                        continue
+
+                # No bounds => check if criteria specifies a concrete version
+                # If criteria version is '*' or '-', we assume it matches (or is a broad platform).
+                # If criteria has a specific version (e.g. '1.4'), we MUST require strict equality.
+                
+                # Check 1: Specific version in criteria?
+                crit_ver = _ver
+                if crit_ver and crit_ver not in ("*", "-"):
+                     norm_crit_ver = normalize_version(crit_ver).lower()
+                     if norm_crit_ver != tv:
+                         continue
+                
+                # Check 2: Wildcard version in criteria ("matches ANY version")?
+                # HEURISTIC: For applications ('a'), if we have a specific installed version,
+                # and the CVE says "matches ANY version" (*) with NO ranges, it's almost always
+                # a false positive (an old CVE where versions weren't entered properly).
+                if _part == "a" and crit_ver in ("*", "-") and tv:
+                     # This is a "matches all" application CVE. Reject it.
+                     continue
+
+                return True
 
     return False
 
-def analyze_software(client: NVDClient, name: str, raw_version: str,
-                     source: str, path: str) -> Optional[Dict[str, Any]]:
-    """Analyzes a single software item for known vulnerabilities."""
-    # Skip system software early (before any API calls)
-    if is_system_software(name, path):
+# ─────────────────────────────────────────────────────────────────────────────
+# Analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SoftwareItem:
+    name: str
+    version: str
+    source: str
+    path: str
+
+def pick_vendor_product(name: str) -> Tuple[str, str]:
+    norm_n = normalize_name(name)
+    vendor = KNOWN_VENDORS.get(norm_n)
+    if not vendor:
+        parts = norm_n.split("_")
+        vendor = parts[0] if parts else "unknown"
+    product = norm_n
+    return vendor, product
+
+def analyze_item(
+    client: NVDClient,
+    kev_set: Optional[set],
+    item: SoftwareItem,
+    max_cpes: int,
+) -> Optional[Dict[str, Any]]:
+    """Analyze a single software item."""
+    if is_system_software(item.name, item.path):
         return None
 
-    norm_n = normalize_name(name)
-    norm_v = normalize_version(raw_version)
-
-    # Skip if we couldn't extract a meaningful version
+    norm_v = normalize_version(item.version)
     if not norm_v or not re.search(r"\d", norm_v):
         return None
 
-    # Determine vendor: use known mapping first, fall back to first word
-    vendor = KNOWN_VENDORS.get(norm_n)
-    if not vendor:
-        parts = norm_n.split('_')
-        vendor = parts[0] if parts else "unknown"
-
-    product = norm_n
+    vendor, product = pick_vendor_product(item.name)
     aliases = get_product_aliases(vendor, product)
 
-    vulns = []
-    matched_vendor = vendor
-    matched_product = product
+    # Step 1: Resolve best CPE(s)
+    resolved_cpes: List[str] = []
     api_failed = False
 
     for v, p in aliases:
-        result = client.search_cves(v, p, norm_v)
-        if result is None:
+        # Pass item.name for strict validation (e.g. preventing 'jq' -> 'jquery')
+        cpes = client.search_cpes(v, p, original_software_name=item.name, max_cpes=max_cpes)
+        if cpes is None:
             api_failed = True
             continue
-        if result:
-            vulns = result
-            matched_vendor = v
-            matched_product = p
+        if cpes:
+            resolved_cpes = cpes
             break
 
-    # If all API calls failed, skip silently (don't report as clean)
-    if not vulns and api_failed:
-        return None
+    if not resolved_cpes and api_failed:
+        return None  # API unreliable; don't claim clean
+    if not resolved_cpes:
+        return None  # No CPE match => avoid false positives
 
-    # Filter CVEs for actual relevance to reduce false positives
-    cve_ids = []
-    max_score = 0.0
-    severity = "NONE"
+    # Step 2: For each CPE candidate, fetch CVEs and pick best match by relevance
+    best: Optional[Dict[str, Any]] = None
 
-    for item in vulns:
-        cve = item.get("cve", {})
-        cve_id = cve.get("id")
-        if not cve_id:
+    for cpe_name in resolved_cpes:
+        vulns = client.fetch_all_cves_for_cpe(cpe_name)
+        if vulns is None:
+            api_failed = True
             continue
 
-        # Validate that this CVE actually applies to our product
-        if not validate_cve_relevance(cve, matched_product, norm_v):
+        cve_ids: List[str] = []
+        max_score = 0.0
+        max_sev = "NONE"
+
+        for v in vulns:
+            cve = (v.get("cve", {}) or {})
+            cve_id = cve.get("id")
+            if not cve_id:
+                continue
+
+            # Strong relevance check against configurations + version bounds
+            if not cve_matches_cpe_and_version(cve, cpe_name, norm_v):
+                continue
+
+            cve_ids.append(cve_id)
+            score, sev = extract_cvss(cve)
+            if score > max_score:
+                max_score = score
+                max_sev = sev
+
+        if not cve_ids:
             continue
 
-        cve_ids.append(cve_id)
-        score, sev = extract_cvss(cve)
-        if score > max_score:
-            max_score = score
-            severity = sev
+        # Build candidate result
+        has_kev = "yes" if (kev_set and any(c in kev_set for c in cve_ids)) else "no"
 
-    if not cve_ids:
+        cand = {
+            "software": item.name,
+            "version": item.version,
+            "source": item.source,
+            "path": item.path,
+            "matched_cpe": cpe_name,
+            "normalized_version": norm_v,
+            "cve_count": len(cve_ids),
+            "max_cvss": max_score,
+            "max_severity": max_sev,
+            "has_kev": has_kev,
+            "top_cves": ";".join(cve_ids[:10]),
+            "example_cve": cve_ids[0] if cve_ids else "",
+            "notes": "",
+        }
+
+        # Choose best candidate:
+        # prefer (has_kev) then higher max_cvss then more cves
+        def score_key(r):
+            return (1 if r["has_kev"] == "yes" else 0, r["max_cvss"], r["cve_count"])
+
+        if best is None or score_key(cand) > score_key(best):
+            best = cand
+
+    if best is None and api_failed:
         return None
+    return best
 
-    return {
-        "software": name,
-        "version": raw_version,
-        "source": source,
-        "normalized_product": matched_product,
-        "normalized_version": norm_v,
-        "cve_count": len(cve_ids),
-        "max_cvss": max_score,
-        "severity": severity,
-        "cve_list": ";".join(cve_ids[:10])
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# Inventory extraction
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Main ────────────────────────────────────────────────────────────────────
+def extract_items(inv: Dict[str, Any]) -> List[SoftwareItem]:
+    """
+    Extract relevant software items.
+    Includes:
+      - apps
+      - homebrew_packages
+      - package_receipts (new)
+    Excludes:
+      - processes / launchd / startup_items (too noisy for CVE matching)
+      - safari_extensions (often weak CPE hit rate)
+      - kernel_extensions (can be added later; naming is messy)
+    """
+    data = inv.get("data", {}) or {}
+    out: List[SoftwareItem] = []
+
+    # Apps
+    for app in (data.get("apps", []) or []):
+        name = (app.get("name") or "").strip()
+        ver = (app.get("version") or "").strip() or (app.get("build") or "").strip()
+        path = (app.get("path") or "").strip()
+        if name and ver:
+            out.append(SoftwareItem(name=name, version=ver, source="Application", path=path))
+
+    # Homebrew
+    for pkg in (data.get("homebrew_packages", []) or []):
+        name = (pkg.get("name") or "").strip()
+        ver = (pkg.get("version") or "").strip()
+        path = (pkg.get("path") or "").strip()
+        if name and ver:
+            out.append(SoftwareItem(name=name, version=ver, source="Homebrew", path=path))
+
+    # PKG receipts (package_id behaves like a product identifier)
+    for r in (data.get("package_receipts", []) or []):
+        name = (r.get("package_id") or "").strip()
+        ver = (r.get("version") or "").strip()
+        path = (r.get("path") or "").strip()
+        if name and ver:
+            out.append(SoftwareItem(name=name, version=ver, source="PKG Receipt", path=path))
+
+    # De-dupe (name, version, source, path)
+    seen = set()
+    uniq: List[SoftwareItem] = []
+    for it in out:
+        key = (it.name, it.version, it.source, it.path)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(it)
+    return uniq
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze mac-inventory output for vulnerabilities")
-    parser.add_argument("-i", "--input", required=True, help="Input JSON file")
-    parser.add_argument("-o", "--output", required=True, help="Output CSV file")
+    parser = argparse.ArgumentParser(description="Analyze mac-inventory output for vulnerabilities (NVD + optional KEV)")
+    parser.add_argument("-i", "--input", required=True, help="Input final_inventory.json")
+    parser.add_argument("-o", "--output", required=True, help="Output CSV file (security_audit.csv)")
+    parser.add_argument("--kev", action="store_true", help="Enable CISA KEV tagging (downloads KEV feed)")
+    parser.add_argument("--kev-url", default=KEV_URL_DEFAULT, help="Override KEV feed URL")
+    parser.add_argument("--max-cpes", type=int, default=5, help="Max CPE candidates to test per software (default 5)")
     args = parser.parse_args()
 
+    # Load inventory
     try:
-        with open(args.input, 'r') as f:
-            data = json.load(f)
+        with open(args.input, "r", encoding="utf-8") as f:
+            inv = json.load(f)
     except Exception as e:
         sys.exit(f"Error reading JSON: {e}")
 
-    # Load API key
+    # API key
     api_key = load_api_key()
     if api_key:
         print("✓ NVD API key loaded (higher rate limit)")
     else:
-        print("⚠️  No NVD API key found — using public rate limit (slower)")
-        print("  Set NVD_API_KEY in .env or as environment variable")
+        print("⚠️  No NVD API key found — public rate limit (slower)")
+        print("   Set NVD_API_KEY in .env or environment variable")
 
     client = NVDClient(api_key)
 
-    # Deduplicate software items
-    software_map: Dict[Tuple, str] = {}
-    for app in data.get("data", {}).get("apps", []):
-        key = (app.get("name"), app.get("version"), app.get("path"))
-        if key not in software_map:
-            software_map[key] = "Application"
-    for pkg in data.get("data", {}).get("homebrew_packages", []):
-        key = (pkg.get("name"), pkg.get("version"), pkg.get("path"))
-        if key not in software_map:
-            software_map[key] = "Homebrew"
+    kev_set = None
+    if args.kev:
+        print("Fetching CISA KEV feed...")
+        kev_set = load_kev_set(args.kev_url)
+        if kev_set is None:
+            print("⚠️  KEV feed unavailable; continuing without KEV tagging")
+        else:
+            print(f"✓ KEV loaded ({len(kev_set)} CVEs)")
 
-    # Pre-filter system software before counting
-    filtered_items = []
-    for (name, ver, path), source in software_map.items():
-        if not is_system_software(name or "", path or ""):
-            filtered_items.append((name, ver, path, source))
+    items = extract_items(inv)
 
-    total = len(filtered_items)
-    results = []
+    # Prefilter system software before scanning
+    filtered = [it for it in items if not is_system_software(it.name, it.path)]
+    skipped = len(items) - len(filtered)
+
+    total = len(filtered)
+    results: List[Dict[str, Any]] = []
     api_errors = 0
-    skipped = len(software_map) - total
 
     print(f"\nAnalyzing {total} user-installed software items ({skipped} system items skipped)")
-    delay_str = f"{client.delay:.1f}s"
-    est_minutes = (total * client.delay) / 60
-    print(f"Rate limit delay: {delay_str}/request (est. {est_minutes:.0f} min)")
+    print(f"Rate limit delay: {client.delay:.1f}s/request (estimate {(total * client.delay)/60:.0f} min)")
     print()
 
-    start_time = time.time()
+    start = time.time()
 
-    for i, (name, ver, path, source) in enumerate(filtered_items, 1):
-        elapsed = time.time() - start_time
-        found_so_far = len(results)
+    for i, it in enumerate(filtered, 1):
+        elapsed = time.time() - start
+        found = len(results)
         sys.stdout.write(
-            f"\r[{i}/{total}] {name} v{ver}"
-            f"  |  ⏱ {elapsed:.0f}s  |  🛡️ {found_so_far} vulns found"
-            + " " * 20  # clear trailing chars
+            f"\r[{i}/{total}] {it.name} v{it.version}"
+            f"  |  ⏱ {elapsed:.0f}s  |  🛡️ {found} vulnerable"
+            + " " * 20
         )
         sys.stdout.flush()
 
         try:
-            res = analyze_software(client, name, ver, source, path or "")
-            if res:
-                results.append(res)
+            r = analyze_item(client, kev_set, it, max_cpes=max(1, args.max_cpes))
+            if r:
+                results.append(r)
         except KeyboardInterrupt:
             print(f"\n\nScan interrupted at item {i}/{total}.")
             break
         except Exception as e:
             api_errors += 1
-            print(f"\n⚠️  Error analyzing {name}: {e}", file=sys.stderr)
+            # Do not crash; mark note for debugging
+            print(f"\n⚠️  Error analyzing {it.name}: {e}", file=sys.stderr)
             continue
 
-    elapsed_total = time.time() - start_time
+    elapsed_total = time.time() - start
     print(f"\n\nAnalysis complete in {elapsed_total:.0f}s")
+    if api_errors:
+        print(f"⚠️  {api_errors} items had errors and were skipped")
 
-    if api_errors > 0:
-        print(f"⚠️  {api_errors} items had API errors and were skipped")
+    # Sort: KEV first, then CVSS desc, then count desc
+    def sort_key(r):
+        return (1 if r.get("has_kev") == "yes" else 0, float(r.get("max_cvss", 0.0)), int(r.get("cve_count", 0)))
 
-    # Sort results by severity (highest CVSS first)
-    results.sort(key=lambda r: r["max_cvss"], reverse=True)
+    results.sort(key=sort_key, reverse=True)
 
-    fieldnames = ["software", "version", "source", "normalized_product",
-                  "normalized_version", "cve_count", "max_cvss", "severity", "cve_list"]
+    # Write CSV
+    fieldnames = [
+        "software", "version", "source", "path",
+        "matched_cpe", "normalized_version",
+        "cve_count", "max_cvss", "max_severity",
+        "has_kev", "top_cves", "example_cve", "notes"
+    ]
 
     try:
-        with open(args.output, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(results)
+
         print(f"\n📄 Report saved to: {args.output}")
         print(f"🛡️  Vulnerable items found: {len(results)}")
     except Exception as e:
